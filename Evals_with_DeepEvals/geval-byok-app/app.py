@@ -1,7 +1,7 @@
 """DeepEval Course Companion — a bring-your-own-key (BYOK) Streamlit app.
 
 A course companion covering four DeepEval topics, picked from the sidebar dropdown:
-- Types of Metrics — G-Eval, DAG, QAG (companion to 06_g_eval_with_deepeval.ipynb).
+- Custom Metrics — G-Eval, DAG, QAG (companion to 06_g_eval_with_deepeval.ipynb).
 - RAG Evals — companion to 01_rag_evals_with_deepeval.ipynb.
 - Agent Evals — companion to 02_agent_evals_with_deepeval.ipynb.
 - Multiturn Evals — companion to 03_chatbot_conversation_evals_with_deepeval.ipynb.
@@ -40,7 +40,7 @@ from ui.tabs import render_mermaid
 APP_TITLE = "🧑‍⚖️ DeepEval Course Companion"
 APP_TAGLINE = "Bring your own Groq key(s) and pick a topic from the sidebar."
 
-SECTIONS = ["Types of Metrics", "RAG Evals", "Agent Evals", "Multiturn Evals"]
+SECTIONS = ["Custom Metrics", "RAG Evals", "Agent Evals", "Multiturn Evals"]
 
 st.set_page_config(page_title=APP_TITLE, page_icon="🧑‍⚖️", layout="wide")
 
@@ -125,6 +125,18 @@ def render_metric_breakdown(breakdown: list[dict]):
     st.dataframe(rows, use_container_width=True, hide_index=True)
 
 
+def render_observability(verbose_logs: str | None):
+    """DeepEval's own metric.verbose_logs — the full step-by-step trace of every internal LLM
+    call a metric made (extracted CoT steps, claims/truths/verdicts, DAG node-by-node output),
+    not just the final score/reason. Shown collapsed so it doesn't clutter the common case, but
+    always available to answer "how did it actually get this score."
+    """
+    if not verbose_logs:
+        return
+    with st.expander("🔍 Observability — step-by-step trace"):
+        st.code(verbose_logs, language=None)
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Tab 1 — G-Eval
 # ──────────────────────────────────────────────────────────────────────────────
@@ -191,6 +203,7 @@ def render_geval_tab():
             verdict = "✅ PASS" if result["success"] else "❌ FAIL"
             st.metric(f"{metric_name} — {verdict}", f"{result['score']:.2f}")
             st.write("**Reason:**", result["reason"])
+            render_observability(result.get("verbose_logs"))
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -216,14 +229,24 @@ def render_dag_tab():
     render_mermaid("""
         graph TD
             TC[Test case] --> Task[Task Node - extract headings]
-            Task --> Gate[Binary Judgement Node - has all three headings]
-            Task --> Order[Non-Binary Judgement Node - correct order]
-            Gate -->|False| V0[Verdict Node - score 0]
-            Gate -->|True| Order
+            Task -->|dependency 1 of 2| Gate[Binary Judgement Node - has all three headings]
+            Task -.->|dependency 2 of 2, waits below| Order[Non-Binary Judgement Node - correct order]
+            Gate -->|False, stop here| V0[Verdict Node - score 0]
+            Gate -.->|True, unlocks Order's 2nd dependency| Order
             Order -->|Yes| V10[Verdict Node - score 10]
             Order -->|Two out of order| V4[Verdict Node - score 4]
             Order -->|All out of order| V2[Verdict Node - score 2]
     """, height=560)
+    st.caption(
+        "⚠️ Look closely: **Order has two incoming edges** — one straight from the Task Node, one "
+        "from the gate's True branch. This is the whole point of it being a *graph*, not a tree: "
+        "DeepEval only actually runs Order's own judgement once **both** edges have arrived. The "
+        "Task Node's edge always arrives; the gate's True edge only arrives if the gate passes. So "
+        "if the gate says **False**, Order's second dependency never shows up and it's silently "
+        "skipped — the run stops at 2 judge calls and the metric scores 0. If the gate says "
+        "**True**, Order actually runs (3rd judge call) and *its* verdict — not the gate's — "
+        "decides the final score. Expand the observability trace below any result to see exactly "
+        "which nodes ran and why.")
 
     st.subheader("1️⃣ The test case")
     input_text = st.text_area(
@@ -286,11 +309,17 @@ def render_dag_tab():
             st.error(f"Judge call failed: {result['reason']}")
         else:
             verdict = "✅ PASS" if result["success"] else "❌ FAIL"
-            st.metric(f"Format Correctness — {verdict}", f"{result['score']:.0f} / 10")
-            st.caption("Verdict Node scores here follow the docs example's own scale (0/2/4/10, "
-                       "not 0-1) — the default threshold (0.5) still treats any nonzero score as "
-                       "a pass.")
+            st.metric(f"Format Correctness — {verdict}", f"{result['score']:.2f}")
+            raw_score = round(result["score"] * 10)
+            st.caption(
+                f"The leaf Verdict Node's raw score was **{raw_score} / 10** (the docs example's "
+                "own scale — 0, 2, 4, or 10 depending on which node/branch was reached). DeepEval "
+                f"normalizes every metric's public `.score` to 0-1, same as every other metric in "
+                f"this app, so {raw_score}/10 becomes **{result['score']:.2f}** above — that's not "
+                "a separate, worse score, it's the same result on the 0-1 scale the ✅/❌ threshold "
+                "(0.5) actually uses.")
             st.write("**Reason:**", result["reason"])
+            render_observability(result.get("verbose_logs"))
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -349,15 +378,19 @@ def render_qag_tab():
             verdict = "✅ PASS" if result["success"] else "❌ FAIL"
             st.metric(f"Faithfulness — {verdict}", f"{result['score']:.2f}")
             st.write("**Reason:**", result["reason"])
+            if result.get("truths"):
+                st.caption("Truths extracted from the retrieval context:")
+                st.write(result["truths"])
             if result["breakdown"]:
                 st.caption("Claim-by-claim breakdown:")
                 st.dataframe(result["breakdown"], use_container_width=True, hide_index=True)
+            render_observability(result.get("verbose_logs"))
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Section: Types of Metrics (existing G-Eval / DAG / QAG tabs, unchanged)
+# Section: Custom Metrics — G-Eval / DAG / QAG tabs
 # ──────────────────────────────────────────────────────────────────────────────
-def render_types_of_metrics_section():
+def render_custom_metrics_section():
     geval_tab, dag_tab, qag_tab = st.tabs(["🧑‍⚖️ G-Eval", "🌳 DAG", "❓ QAG"])
     with geval_tab:
         render_geval_tab()
@@ -834,8 +867,8 @@ def main():
         st.info("👈 Paste your Groq API key in the sidebar and click **Validate** to begin.")
         return
 
-    if section == "Types of Metrics":
-        render_types_of_metrics_section()
+    if section == "Custom Metrics":
+        render_custom_metrics_section()
     elif section == "RAG Evals":
         render_rag_section()
     elif section == "Agent Evals":

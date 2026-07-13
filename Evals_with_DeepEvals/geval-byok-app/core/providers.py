@@ -31,27 +31,108 @@ from types import SimpleNamespace
 from core.config import GROQ_BASE_URL, GROQ_JUDGE_MODEL, GROQ_MODEL, JUDGE_CALL_PACING_SECONDS
 
 
+def _patch_deepeval_non_binary_template_bug() -> None:
+    """Works around a copy-paste bug in deepeval==4.1.0: NonBinaryJudgementNode._execute/
+    _a_execute (deepeval/metrics/dag/nodes.py) call self._get_prompt("generate_non_binary_verdict",
+    template_class="BinaryJudgement", ...) -- template_class should be "NonBinaryJudgement" but was
+    left as the literal copied from BinaryJudgementNode's own (correct) calls. This makes any DAG
+    with a NonBinaryJudgementNode -- e.g. the official docs example -- fail 100% of the time with
+    MetricTemplateNotFoundError, before any judge call happens. Confirmed present in the latest
+    PyPI release (4.1.0); no upstream fix yet. Patched at the one place both node types actually
+    call through (PromptMixin._get_prompt -> resolve_template, deepeval/metrics/base_metric.py),
+    intercepting only this exact broken (class_name, method) pair so a real BinaryJudgement call
+    is never touched.
+    """
+    import deepeval.metrics.base_metric as base_metric
+
+    if getattr(base_metric.resolve_template, "_dag_non_binary_patch", False):
+        return
+
+    original_resolve = base_metric.resolve_template
+
+    def patched_resolve(feature, class_name, method, **kwargs):
+        if class_name == "BinaryJudgement" and method == "generate_non_binary_verdict":
+            class_name = "NonBinaryJudgement"
+        return original_resolve(feature, class_name, method, **kwargs)
+
+    patched_resolve._dag_non_binary_patch = True
+    base_metric.resolve_template = patched_resolve
+
+
+_patch_deepeval_non_binary_template_bug()
+
+
+def _patch_dag_tasknode_output_leniency() -> None:
+    """TaskNode's output schema (deepeval/metrics/dag/schema.py::TaskNodeOutput) is
+    `output: Union[str, list[str], dict[str, str]]`. Groq's LocalModel has no real JSON-schema
+    enforcement -- DeepEval only prompts the model to match this shape, then validates the raw
+    JSON against it. When a TaskNode's instructions ask the model to "extract" something (e.g.
+    "Extract all headings"), models -- even reliable ones -- sometimes wrap the extracted list
+    under a descriptive key instead of returning it bare, e.g. {"output": {"headings": ["Intro",
+    "Body", "Conclusion"]}} instead of {"output": ["Intro", "Body", "Conclusion"]}. That value
+    doesn't match any of the 3 Union variants (dict[str,str] requires string values, not a list),
+    so pydantic raises ValidationError and the whole DAG run fails over a shape the model actually
+    got right in substance. This patches TaskNodeOutput.model_validate to retry once with that one
+    specific unwrap (a single-key dict standing in for its value) only after the original,
+    unmodified validation has already failed -- a correctly-shaped answer, including a genuine
+    single-entry dict[str,str], is never touched.
+    """
+    from deepeval.metrics.dag.schema import TaskNodeOutput
+    from pydantic import ValidationError
+
+    if getattr(TaskNodeOutput, "_lenient_patch", False):
+        return
+
+    original_validate = TaskNodeOutput.model_validate.__func__
+
+    def patched_validate(cls, obj, *args, **kwargs):
+        try:
+            return original_validate(cls, obj, *args, **kwargs)
+        except ValidationError:
+            if (
+                isinstance(obj, dict)
+                and isinstance(obj.get("output"), dict)
+                and len(obj["output"]) == 1
+            ):
+                unwrapped = {**obj, "output": next(iter(obj["output"].values()))}
+                return original_validate(cls, unwrapped, *args, **kwargs)
+            raise
+
+    patched_classmethod = classmethod(patched_validate)
+    TaskNodeOutput.model_validate = patched_classmethod
+    TaskNodeOutput._lenient_patch = True
+
+
+_patch_dag_tasknode_output_leniency()
+
+
 def _build_judge():
-    from deepeval.models import LocalModel
-    return LocalModel(model=GROQ_JUDGE_MODEL, api_key=os.environ.get("GROQ_API_KEY"),
-                       base_url=GROQ_BASE_URL, temperature=0)
-
-
-def _build_argument_judge():
-    """ArgumentCorrectnessMetric's prompt is the most complex one any metric in this app sends:
-    a 3-tool-call few-shot example written in raw Python-repr syntax (`ToolCall(name=...,
-    input_parameters={...})`), heavy with nested braces, right before a strict "ONLY return
-    valid JSON" instruction. DeepEval extracts JSON from the judge's raw text with a naive
-    first-'{'-to-last-'}' scan (deepeval/models/llms/utils.py:trim_and_load_json) rather than a
-    real parser, so any stray brace in commentary the model adds around its answer breaks
-    extraction and surfaces as "outputted an invalid JSON". GROQ_JUDGE_MODEL (a smaller model,
-    picked for its higher TPM headroom on the trace-heavy metrics) is more prone to that than
-    GROQ_MODEL, which this app already relies on elsewhere for reliable structured tool-call
-    output. Argument Correctness only makes 1-2 calls, so TPM isn't the constraint here that it
-    is for the trace-based metrics -- reliability is worth more than headroom for this one.
+    """The default judge for every metric except the 4 trace-based agent metrics (see
+    _build_trace_judge). Uses GROQ_MODEL (llama-3.3-70b-versatile) -- the same model this app
+    already relies on for generation -- because several metrics send long, structured-output-
+    heavy prompts (e.g. Argument Correctness's few-shot example, DAG's TaskNode extracting a
+    Union[str, list[str], dict[str,str]]-typed output) where GROQ_JUDGE_MODEL (a smaller model)
+    has shown real, reproducible schema/JSON-formatting failures under real-network latency:
+    ArgumentCorrectnessMetric raising "Evaluation LLM outputted an invalid JSON", and DAG's
+    TaskNode returning a shape (e.g. a value wrapped in an extra dict key) that fails Pydantic
+    validation against TaskNodeOutput. Every other metric here makes only a handful of calls per
+    click, so GROQ_JUDGE_MODEL's extra TPM headroom isn't needed -- reliability wins.
     """
     from deepeval.models import LocalModel
     return LocalModel(model=GROQ_MODEL, api_key=os.environ.get("GROQ_API_KEY"),
+                       base_url=GROQ_BASE_URL, temperature=0)
+
+
+def _build_trace_judge():
+    """Judge for the 4 trace-based agent metrics only (Step Efficiency, Plan Adherence, Plan
+    Quality, Task Completion). Each makes 2-3 internal extract-then-score LLM calls with verbose
+    prompts, so a single fully-scored agent run is realistically ~12-13 judge calls -- across a
+    batch of several runs that reliably exceeds GROQ_MODEL's 12K TPM cap. GROQ_JUDGE_MODEL trades
+    some structured-output reliability for 30K TPM (2.5x), which is worth it specifically here
+    since these 4 metrics are the only ones that generate enough call volume to hit the cap.
+    """
+    from deepeval.models import LocalModel
+    return LocalModel(model=GROQ_JUDGE_MODEL, api_key=os.environ.get("GROQ_API_KEY"),
                        base_url=GROQ_BASE_URL, temperature=0)
 
 
@@ -105,7 +186,7 @@ def run_geval(
 ) -> dict:
     """Build the judge + metric, evaluate one test case, return a plain-dict result.
 
-    Returns {"score": float | None, "reason": str, "success": bool}.
+    Returns {"score": float | None, "reason": str, "success": bool, "verbose_logs": str}.
     """
     from deepeval.metrics import GEval
     from deepeval.test_case import LLMTestCase, SingleTurnParams
@@ -130,7 +211,12 @@ def run_geval(
     )
 
     metric.measure(test_case)
-    return {"score": metric.score, "reason": metric.reason, "success": metric.is_successful()}
+    return {
+        "score": metric.score,
+        "reason": metric.reason,
+        "success": metric.is_successful(),
+        "verbose_logs": metric.verbose_logs,
+    }
 
 
 def run_dag(
@@ -142,12 +228,25 @@ def run_dag(
 ) -> dict:
     """DeepEval docs' own DAG example (https://deepeval.com/docs/metrics-dag): a TaskNode
     extracts the summary's headings, a BinaryJudgementNode checks all three are present (score 0
-    and stop if not), and — only then — a NonBinaryJudgementNode checks their order (score 10/4/2
-    depending on how out of order). The order node is a genuine second child of the TaskNode too,
-    which is what makes this a graph rather than a tree. Worst case 3 judge calls (extract, gate,
-    order), best case 2 (order skipped if the gate fails).
+    and stop if not), and — only then — a NonBinaryJudgementNode checks their order (raw
+    VerdictNode score 10/4/2 depending on how out of order). extract_headings_node.children lists
+    BOTH the gate and the order node directly (not just the gate) -- this is deliberate and is
+    what makes this a genuine graph rather than a tree: the order node has two parents (the
+    TaskNode itself, and the gate's True-branch VerdictNode), and DeepEval's indegree-based
+    executor (deepeval/metrics/dag/nodes.py) only actually runs a node's own judgement once ALL of
+    its parents have resolved. Traced through the source: the order node's _execute() is called
+    twice per run (once directly by the TaskNode's child loop, once via the gate's True VerdictNode
+    if the gate passes) but only performs its real LLM call on whichever of those two calls is the
+    *second* one to arrive -- so if the gate returns False, the order node's indegree never reaches
+    zero and it's skipped entirely (score 0, 2 judge calls total); if the gate returns True, the
+    order node's own judgement determines the final score (3 judge calls total). Worst case 3
+    judge calls, best case 2.
 
-    Returns {"score": float | None, "reason": str, "success": bool}.
+    metric.score is DeepEval's own normalization of the leaf VerdictNode's raw 0-10 score to 0-1
+    (VerdictNode._execute: `metric.score = self.score / 10`) -- same 0-1 scale every other metric
+    in this app uses, not a fraction out of 10.
+
+    Returns {"score": float | None, "reason": str, "success": bool, "verbose_logs": str}.
     """
     from deepeval.metrics import DAGMetric
     from deepeval.metrics.dag import (
@@ -188,7 +287,12 @@ def run_dag(
 
     test_case = LLMTestCase(input=input_text, actual_output=actual_output)
     metric.measure(test_case)
-    return {"score": metric.score, "reason": metric.reason, "success": metric.is_successful()}
+    return {
+        "score": metric.score,
+        "reason": metric.reason,
+        "success": metric.is_successful(),
+        "verbose_logs": metric.verbose_logs,
+    }
 
 
 def run_qag(
@@ -200,7 +304,8 @@ def run_qag(
     from actual_output, ask a closed yes/no/idk question per claim against retrieval_context,
     then compute the score mathematically (no LLM score-guessing). One test case per call.
 
-    Returns {"score": float | None, "reason": str, "success": bool, "breakdown": list[dict]}.
+    Returns {"score": float | None, "reason": str, "success": bool, "breakdown": list[dict],
+             "truths": list[str], "verbose_logs": str}.
     """
     from deepeval.metrics import FaithfulnessMetric
     from deepeval.test_case import LLMTestCase
@@ -227,6 +332,8 @@ def run_qag(
         "reason": metric.reason,
         "success": metric.is_successful(),
         "breakdown": breakdown,
+        "truths": getattr(metric, "truths", []) or [],
+        "verbose_logs": metric.verbose_logs,
     }
 
 
@@ -455,6 +562,7 @@ def run_agent_evaluation(run: dict) -> dict:
     from deepeval.test_case import LLMTestCase, ToolCall
 
     judge = _build_judge()
+    trace_judge = _build_trace_judge()
     tools_called = [
         ToolCall(name=ev["tool"], input_parameters=ev["input"], output=ev["output"])
         for ev in run["tool_events"]
@@ -470,14 +578,14 @@ def run_agent_evaluation(run: dict) -> dict:
     test_case._trace_dict = run["trace"]
 
     metrics = [
-        StepEfficiencyMetric(model=judge, async_mode=False),
-        PlanAdherenceMetric(model=judge, async_mode=False),
-        PlanQualityMetric(model=judge, async_mode=False),
-        TaskCompletionMetric(model=judge, task=run.get("goal") or None, async_mode=False),
+        StepEfficiencyMetric(model=trace_judge, async_mode=False),
+        PlanAdherenceMetric(model=trace_judge, async_mode=False),
+        PlanQualityMetric(model=trace_judge, async_mode=False),
+        TaskCompletionMetric(model=trace_judge, task=run.get("goal") or None, async_mode=False),
     ]
     if expected_tools:
         metrics = [ToolCorrectnessMetric(model=judge, async_mode=False),
-                   ArgumentCorrectnessMetric(model=_build_argument_judge(), async_mode=False)] + metrics
+                   ArgumentCorrectnessMetric(model=judge, async_mode=False)] + metrics
 
     breakdown = _measure_metrics(metrics, test_case)
     return {"breakdown": breakdown}

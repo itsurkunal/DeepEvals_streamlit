@@ -5,11 +5,14 @@ A hands-on companion to the course notebooks (`01_rag_evals_with_deepeval.ipynb`
 `06_g_eval_with_deepeval.ipynb`). Learners paste their own Groq key(s) into the sidebar; once
 it validates, a topic dropdown picks which section renders on the right:
 
-- **Types of Metrics** — G-Eval, DAG, QAG. Define a metric via plain-English `criteria` or an
-  `evaluation_steps` checklist (G-Eval), a rule-based decision tree — the official docs example:
-  extract a summary's headings, check they're all present, then check they're in order (DAG), or
-  claim-by-claim yes/no/idk questioning with the score computed mathematically instead of guessed
-  by the LLM (QAG, via `FaithfulnessMetric`).
+- **Custom Metrics** — G-Eval, DAG, QAG. Define a metric via plain-English `criteria` or an
+  `evaluation_steps` checklist (G-Eval), a rule-based decision graph — the official docs example:
+  extract a summary's headings, check they're all present, then (only if they are) check they're
+  in order (DAG), or claim-by-claim yes/no/idk questioning with the score computed mathematically
+  instead of guessed by the LLM (QAG, via `FaithfulnessMetric`). Each tab includes a collapsible
+  observability trace (`metric.verbose_logs`) showing every internal LLM call the metric made —
+  G-Eval's generated CoT steps, QAG's truths/claims/verdicts, or DAG's node-by-node output — not
+  just the final score.
 - **RAG Evals** — a 3-tab workflow mirroring a real RAG eval pipeline: **Ground Truths** (the
   knowledge base + a curated question/expected-answer dataset, extendable in the UI) →
   **RAG Pipeline** (the naive retriever + a Groq-generated answer, grounded in what was

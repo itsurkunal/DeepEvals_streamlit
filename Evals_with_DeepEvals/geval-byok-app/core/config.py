@@ -1,16 +1,21 @@
 """core/config.py — model names and tunable constants in one place."""
 
-# Generation ("model under test") — llama-3.3-70b-versatile, proven reliable for the short
-# RAG/Agent/Multiturn prompts this app sends. 30 RPM / 12K TPM per Groq account.
+# Generation ("model under test") AND the default judge for every metric except the 4 trace-
+# based agent metrics — llama-3.3-70b-versatile, proven reliable for both generating and closely
+# following structured-output/JSON instructions across this app's prompts. 30 RPM / 12K TPM per
+# Groq account. See core/providers.py::_build_judge for why this is the *default* judge, not
+# GROQ_JUDGE_MODEL: smaller judge models have shown real, reproducible schema/JSON failures on
+# this app's more complex prompts (Argument Correctness, DAG's TaskNode).
 GROQ_MODEL = "llama-3.3-70b-versatile"
 
-# Judge — deliberately a different model from generation. The 4 trace-based agent metrics
-# (Step Efficiency, Plan Adherence, Plan Quality, Task Completion) each make 2-3 internal LLM
-# calls apiece (extract, then score) with verbose prompt templates, so a single fully-evaluated
-# agent run is more like 12-13 real judge calls, not 6 — llama-3.3-70b-versatile's 12K TPM cap
+# Judge for the 4 trace-based agent metrics ONLY (Step Efficiency, Plan Adherence, Plan Quality,
+# Task Completion) — see core/providers.py::_build_trace_judge. Each of those metrics makes 2-3
+# internal LLM calls apiece (extract, then score) with verbose prompt templates, so a single
+# fully-evaluated agent run is more like 12-13 real judge calls, not 6 — GROQ_MODEL's 12K TPM cap
 # gets exhausted fast across a batch of several runs. meta-llama/llama-4-scout-17b-16e-instruct
-# has 30K TPM (2.5x) for the same 1K RPD, at the same free tier, giving much more headroom for
-# exactly this workload — see console.groq.com/docs/rate-limits.
+# has 30K TPM (2.5x) for the same 1K RPD, at the same free tier, trading some structured-output
+# reliability for headroom — worth it only for these 4 metrics' call volume, not app-wide — see
+# console.groq.com/docs/rate-limits.
 GROQ_JUDGE_MODEL = "meta-llama/llama-4-scout-17b-16e-instruct"
 
 # Groq's API is OpenAI-compatible; DeepEval's LocalModel talks to any OpenAI-compatible endpoint.
